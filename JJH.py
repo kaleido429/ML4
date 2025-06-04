@@ -1,345 +1,532 @@
 import tensorflow as tf
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization
-from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization, Input, LeakyReLU, GlobalAveragePooling2D
+from tensorflow.keras.models import Sequential, Model
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from sklearn.metrics import f1_score, accuracy_score, confusion_matrix
+from sklearn.metrics import f1_score, accuracy_score, confusion_matrix, classification_report, roc_curve, auc
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
-import os
+import seaborn as sns # 시각화를 위한 라이브러리
+import os # 파일 및 디렉토리 작업을 위한 모듈 + GPU 설정
 import random
-import shutil # For splitting dataset
+import shutil # 폴더 및 파일 작업을 위한 모듈
+import time
+from datetime import datetime
 
-# --- Configuration ---
-# TASK: User needs to set this path to the extracted 'caltech-101' directory
-# It should contain '101_ObjectCategories' and 'BACKGROUND_Google'
-BASE_DATASET_PATH = './caltech-101' # Example path
-
-# Processed dataset directory
-PROCESSED_DATA_PATH = './caltech_101_processed'
-TRAIN_DIR = os.path.join(PROCESSED_DATA_PATH, 'train')
-VALIDATION_DIR = os.path.join(PROCESSED_DATA_PATH, 'validation')
-TEST_DIR = os.path.join(PROCESSED_DATA_PATH, 'test')
-
-# For image processing
-IMG_WIDTH = 128  # Reduced from 224x224 for faster training on a custom model
-IMG_HEIGHT = 128
-CHANNELS = 3
-IMAGE_SIZE = (IMG_HEIGHT, IMG_WIDTH)
-INPUT_SHAPE = (IMG_HEIGHT, IMG_WIDTH, CHANNELS)
-
-# Training parameters
-BATCH_SIZE = 32 # Describe why you chose this [cite: 21]
-EPOCHS = 50    # Describe why you chose this [cite: 21] (Early stopping will be used)
-NUM_CLASSES = 102 # 101 object categories + 1 background category
-
-# --- 1. Dataset Preparation ---
-def create_processed_dirs():
-    # This function creates train/validation/test directories.
-    # It's important for organizing data for ImageDataGenerator.
-    if os.path.exists(PROCESSED_DATA_PATH):
-        print(f"Processed data path {PROCESSED_DATA_PATH} already exists. Skipping creation or cleaning up.")
-        # You might want to add logic here to either use existing or delete and recreate
-        # For safety in this example, if it exists, we assume it's correctly populated.
-        # return
-        shutil.rmtree(PROCESSED_DATA_PATH) # Clean up for a fresh run
-        print(f"Cleaned up existing processed data path: {PROCESSED_DATA_PATH}")
-
-    os.makedirs(PROCESSED_DATA_PATH, exist_ok=True)
-    os.makedirs(TRAIN_DIR, exist_ok=True)
-    os.makedirs(VALIDATION_DIR, exist_ok=True)
-    os.makedirs(TEST_DIR, exist_ok=True)
-
-    all_categories = []
-    # Add object categories
-    obj_cat_path = os.path.join(BASE_DATASET_PATH, '101_ObjectCategories')
-    if not os.path.exists(obj_cat_path):
-        print(f"ERROR: Dataset not found at {obj_cat_path}. Please download and place it correctly.")
-        return False
-        
-    for category in os.listdir(obj_cat_path):
-        if os.path.isdir(os.path.join(obj_cat_path, category)):
-            all_categories.append(os.path.join(obj_cat_path, category))
-
-    # Add background category
-    bg_cat_path = os.path.join(BASE_DATASET_PATH, 'BACKGROUND_Google')
-    if os.path.exists(bg_cat_path) and os.path.isdir(bg_cat_path):
-         all_categories.append(bg_cat_path)
+# GPU 설정 및 확인
+def setup_gpu():
+    """
+    GPU 사용 설정 및 확인
+    TensorFlow가 GPU를 사용할 수 있도록 메모리 증가를 허용
+    """
+    # GPU 장치 확인
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            # GPU 메모리 증가 허용 (필요에 따라 메모리 할당)
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            print(f"GPU 사용 가능: {len(gpus)}개의 GPU 감지됨")
+            print(f"GPU 장치: {[gpu.name for gpu in gpus]}")
+        except RuntimeError as e:
+            print(f"GPU 설정 오류: {e}")
     else:
-        print(f"Warning: BACKGROUND_Google category not found at {bg_cat_path}")
-
-
-    if not all_categories:
-        print("No image categories found. Please check BASE_DATASET_PATH.")
-        return False
-
-    for category_path in all_categories:
-        category_name = os.path.basename(category_path)
-
-        # Create subdirectories in train, validation, test
-        os.makedirs(os.path.join(TRAIN_DIR, category_name), exist_ok=True)
-        os.makedirs(os.path.join(VALIDATION_DIR, category_name), exist_ok=True)
-        os.makedirs(os.path.join(TEST_DIR, category_name), exist_ok=True)
-
-        images = [img for img in os.listdir(category_path) if img.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        random.shuffle(images)
-
-        # Splitting: 80% train, 10% validation, 10% test [cite: 23]
-        train_split = int(0.8 * len(images))
-        val_split = int(0.9 * len(images)) # 0.8 to 0.9 is 10% for validation
-
-        train_images = images[:train_split]
-        val_images = images[train_split:val_split]
-        test_images = images[val_split:]
-
-        for img in train_images:
-            shutil.copy(os.path.join(category_path, img), os.path.join(TRAIN_DIR, category_name, img))
-        for img in val_images:
-            shutil.copy(os.path.join(category_path, img), os.path.join(VALIDATION_DIR, category_name, img))
-        for img in test_images:
-            shutil.copy(os.path.join(category_path, img), os.path.join(TEST_DIR, category_name, img))
+        print("GPU를 사용할 수 없습니다. CPU로 실행됩니다.")
     
-    print("Dataset successfully split into train, validation, and test sets.")
-    return True
+    # 현재 사용 중인 장치 확인
+    print(f"TensorFlow 버전: {tf.__version__}")
+    print(f"사용 가능한 GPU: {tf.config.list_physical_devices('GPU')}")
 
+# 하이퍼파라미터 설정
+class Config:
+    """
+    하이퍼파라미터 및 설정 클래스
+    실험을 위한 다양한 설정값들을 관리
+    """
+    # 데이터셋 경로 설정
+    BASE_DATASET_PATH = './caltech-101'  # Caltech-101 데이터셋 경로
+    PROCESSED_DATA_PATH = './caltech_101_processed'
+    
+    # 이미지 전처리 파라미터
+    IMG_WIDTH = 256    # 이미지 너비 (계산 효율성을 위해 128로 설정)
+    IMG_HEIGHT = 256   # 이미지 높이
+    CHANNELS = 3       # RGB 채널
+    INPUT_SHAPE = (IMG_HEIGHT, IMG_WIDTH, CHANNELS)
+    
+    # 훈련 하이퍼파라미터
+    BATCH_SIZE = 32    # 미니배치 크기: GPU 메모리와 수렴 안정성 고려
+    EPOCHS = 75        # 최대 에포크 수 (Early Stopping 사용)
+    LEARNING_RATE = 0.001  # 학습률: Adam optimizer의 기본값
+    
+    # 데이터 분할 비율
+    TRAIN_RATIO = 0.8  # 훈련 데이터 80%
+    VAL_RATIO = 0.1    # 검증 데이터 10%
+    TEST_RATIO = 0.1   # 테스트 데이터 10%
+    
+    # 실험 설정
+    NUM_TRIALS = 1     # 1회만 실행으로 변경
 
-def get_data_generators():
-    # Data augmentation for training to improve robustness
-    # Normalization is crucial
+def create_directory_structure():
+    """
+    데이터셋 디렉토리 구조 생성
+    훈련/검증/테스트용 폴더를 생성하고 데이터를 분할
+    """
+    config = Config()
+    
+    # 기존 처리된 데이터 제거 (새로운 분할을 위해)
+    if os.path.exists(config.PROCESSED_DATA_PATH):
+        shutil.rmtree(config.PROCESSED_DATA_PATH)
+        print(f"기존 처리된 데이터 제거: {config.PROCESSED_DATA_PATH}")
+    
+    # 새 디렉토리 생성
+    train_dir = os.path.join(config.PROCESSED_DATA_PATH, 'train')
+    val_dir = os.path.join(config.PROCESSED_DATA_PATH, 'validation')
+    test_dir = os.path.join(config.PROCESSED_DATA_PATH, 'test')
+    
+    os.makedirs(train_dir, exist_ok=True)
+    os.makedirs(val_dir, exist_ok=True)
+    os.makedirs(test_dir, exist_ok=True)
+    
+    # 원본 데이터셋 확인
+    if not os.path.exists(config.BASE_DATASET_PATH):
+        raise FileNotFoundError(f"데이터셋을 찾을 수 없습니다: {config.BASE_DATASET_PATH}")
+    
+    # 카테고리별 데이터 분할
+    categories = []
+    for item in os.listdir(config.BASE_DATASET_PATH):
+        item_path = os.path.join(config.BASE_DATASET_PATH, item)
+        if os.path.isdir(item_path):
+            # 이미지 파일이 있는 폴더만 포함
+            images = [f for f in os.listdir(item_path) 
+                     if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            if len(images) >= 3:  # 최소 3개 이상의 이미지가 있는 카테고리만 포함
+                categories.append(item_path)
+    
+    print(f"총 {len(categories)}개의 카테고리 발견")
+    
+    # 각 카테고리별로 데이터 분할
+    for category_path in categories:
+        category_name = os.path.basename(category_path)
+        
+        # 각 분할에 대한 카테고리 폴더 생성
+        os.makedirs(os.path.join(train_dir, category_name), exist_ok=True)
+        os.makedirs(os.path.join(val_dir, category_name), exist_ok=True)
+        os.makedirs(os.path.join(test_dir, category_name), exist_ok=True)
+        
+        # 이미지 목록 가져오기 및 셔플
+        images = [f for f in os.listdir(category_path) 
+                 if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        random.shuffle(images)
+        
+        # 데이터 분할 인덱스 계산
+        n_images = len(images)
+        train_end = int(config.TRAIN_RATIO * n_images)
+        val_end = int((config.TRAIN_RATIO + config.VAL_RATIO) * n_images)
+        
+        # 데이터 분할
+        train_images = images[:train_end]
+        val_images = images[train_end:val_end]
+        test_images = images[val_end:]
+        
+        # 파일 복사
+        for img in train_images:
+            shutil.copy2(os.path.join(category_path, img), 
+                        os.path.join(train_dir, category_name, img))
+        for img in val_images:
+            shutil.copy2(os.path.join(category_path, img), 
+                        os.path.join(val_dir, category_name, img))
+        for img in test_images:
+            shutil.copy2(os.path.join(category_path, img), 
+                        os.path.join(test_dir, category_name, img))
+    
+    print("데이터셋 분할 완료")
+    return len(categories)
+
+def create_data_generators():
+    """
+    데이터 제너레이터 생성
+    훈련용: 데이터 증강 적용
+    검증/테스트용: 정규화만 적용
+    """
+    config = Config()
+    
+    # 훈련용 데이터 증강 설정
+    # 회전, 이동, 전단, 확대/축소, 수평 뒤집기를 통한 데이터 증강
     train_datagen = ImageDataGenerator(
-        rescale=1./255,
-        rotation_range=20,
-        width_shift_range=0.2,
-        height_shift_range=0.2,
-        shear_range=0.2,
-        zoom_range=0.2,
-        horizontal_flip=True,
-        fill_mode='nearest'
+        rescale=1./255,           # 픽셀값 정규화 [0,1]
+        rotation_range=20,        # 20도 범위 내 회전
+        width_shift_range=0.2,    # 수평 이동
+        height_shift_range=0.2,   # 수직 이동
+        shear_range=0.2,          # 전단 변환
+        zoom_range=0.2,           # 확대/축소
+        horizontal_flip=True,     # 수평 뒤집기
+        fill_mode='nearest'       # 빈 공간 채우기 방법
     )
-
-    # Validation and test generators should only rescale
+    
+    # 검증/테스트용: 정규화만 적용
     validation_datagen = ImageDataGenerator(rescale=1./255)
     test_datagen = ImageDataGenerator(rescale=1./255)
-
+    
+    # 데이터 제너레이터 생성
     train_generator = train_datagen.flow_from_directory(
-        TRAIN_DIR,
-        target_size=IMAGE_SIZE,
-        batch_size=BATCH_SIZE,
+        os.path.join(config.PROCESSED_DATA_PATH, 'train'),
+        target_size=(config.IMG_HEIGHT, config.IMG_WIDTH),
+        batch_size=config.BATCH_SIZE,
         class_mode='categorical',
         shuffle=True
     )
-
+    
     validation_generator = validation_datagen.flow_from_directory(
-        VALIDATION_DIR,
-        target_size=IMAGE_SIZE,
-        batch_size=BATCH_SIZE,
+        os.path.join(config.PROCESSED_DATA_PATH, 'validation'),
+        target_size=(config.IMG_HEIGHT, config.IMG_WIDTH),
+        batch_size=config.BATCH_SIZE,
         class_mode='categorical',
         shuffle=False
     )
-
+    
     test_generator = test_datagen.flow_from_directory(
-        TEST_DIR,
-        target_size=IMAGE_SIZE,
-        batch_size=BATCH_SIZE, # Can be 1 or BATCH_SIZE for evaluation
+        os.path.join(config.PROCESSED_DATA_PATH, 'test'),
+        target_size=(config.IMG_HEIGHT, config.IMG_WIDTH),
+        batch_size=config.BATCH_SIZE,
         class_mode='categorical',
         shuffle=False
     )
     
-    # Verify number of classes picked up by generator
-    # global NUM_CLASSES # Ensure NUM_CLASSES is updated based on what generator found.
-    # NUM_CLASSES = train_generator.num_classes
-    # print(f"Number of classes detected by ImageDataGenerator: {NUM_CLASSES}")
-    # Actually, NUM_CLASSES should be set based on the folders prepared.
-    # The check above is a good sanity check.
-    
-    # Example of image transformation for the report [cite: 21]
-    # x_batch, y_batch = next(train_generator)
-    # first_image_transformed = x_batch[0]
-    # plt.imshow(first_image_transformed)
-    # plt.title("Example of a Transformed Training Image")
-    # plt.show() # You would save this plot for the report.
-
     return train_generator, validation_generator, test_generator
 
-# --- 2. Model Definition ---
-# TASK: Design your CNN. Explain each layer choice in your report. [cite: 18, 20]
-# This is a basic example. You might want more layers, different filter sizes, dropout, batch normalization etc.
 def create_cnn_model(input_shape, num_classes):
-    # This is where the "forward propagation" path is defined. [cite: 21]
-    # TensorFlow will automatically handle "backward propagation" during training.
+    """
+    CNN 모델 생성 함수
+    - 입력 이미지 크기와 클래스 수를 기반으로 모델 구성
+    - Batch Normalization, Dropout, MaxPooling2D 레이어 포함
+    Args:
+        input_shape: 입력 이미지 크기 (height, width, channels)
+        num_classes: 분류할 클래스 수
+    Returns:
+        model: 컴파일된 CNN 모델
+    1. Conv2D 레이어를 사용하여 특징 추출
+    2. Batch Normalization으로 학습 안정성 향상
+    3. MaxPooling2D로 공간적 차원 축소
+    4. Dropout으로 과적합 방지
+    5. Flatten 후 Dense 레이어로 분류
+    6. 최종 출력 레이어는 softmax 활성화 함수 사용
+    """
     model = Sequential([
-        # Convolutional Block 1
-        # Explain filter size, kernel size, strides, padding, activation. [cite: 19, 20]
-        Conv2D(32, (3, 3), activation='relu', input_shape=input_shape, padding='same'),
-        # BatchNormalization(), # Optional: Can help stabilize and speed up training
+        # Convolutional Block 1 (큰 필터로 초기 특성 추출)
+        Conv2D(64, (5, 5), activation='relu', input_shape=input_shape, padding='same'),
+        BatchNormalization(),
         MaxPooling2D((2, 2)),
-        # Dropout(0.25), # Optional: Regularization
-
+        Dropout(0.25),
+        
         # Convolutional Block 2
-        Conv2D(64, (3, 3), activation='relu', padding='same'),
-        # BatchNormalization(),
-        MaxPooling2D((2, 2)),
-        # Dropout(0.25),
-
-        # Convolutional Block 3
         Conv2D(128, (3, 3), activation='relu', padding='same'),
-        # BatchNormalization(),
+        BatchNormalization(),
         MaxPooling2D((2, 2)),
-        # Dropout(0.25),
-
-        # Flattening the 3D output to 1D for Dense layers
+        Dropout(0.25),
+        
+        # Convolutional Block 3
+        Conv2D(256, (3, 3), activation='relu', padding='same'),
+        BatchNormalization(),
+        MaxPooling2D((2, 2)),
+        Dropout(0.3),
+        
+        # Convolutional Block 4
+        Conv2D(512, (3, 3), activation='relu', padding='same'),
+        BatchNormalization(),
+        MaxPooling2D((2, 2)),
+        Dropout(0.3),
+        
+        # Flatten -> Fully Connected
         Flatten(),
-
-        # Fully Connected Layer
+        
+        # Dense Layer 1
         Dense(512, activation='relu'),
-        # BatchNormalization(),
-        # Dropout(0.5), # Dropout before the final classification layer
-
+        BatchNormalization(),
+        Dropout(0.5),
+        # Dense Layer 2
+        Dense(256, activation='relu'),
+        BatchNormalization(),
+        Dropout(0.5),
+        # Dense Layer 3
+        Dense(128, activation='relu'),
+        BatchNormalization(),
+        Dropout(0.5),
         # Output Layer
-        # Softmax for multi-class classification
         Dense(num_classes, activation='softmax')
     ])
-
-    # Optimizer choice: Adam is a common default. Explain why you chose it. [cite: 21]
-    optimizer = tf.keras.optimizers.Adam(learning_rate=0.001) # Experiment with learning rates [cite: 22]
-
-    # Loss function: Categorical crossentropy for multi-class. Explain. [cite: 21]
-    model.compile(optimizer=optimizer,
-                  loss='categorical_crossentropy',
-                  metrics=['accuracy', tf.keras.metrics.F1Score(average='macro', name='f1_score')]) # F1 score for TF 2.6+
-                  # For older TF, you might need to calculate F1 manually using sklearn after prediction
-
-    model.summary() # Prints the model structure, useful for the report's table [cite: 19]
+    
+    optimizer = tf.keras.optimizers.Adam(learning_rate=Config.LEARNING_RATE)
+    model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
+    model.summary()
     return model
 
-# --- 3. Training ---
-def train_model(model, train_generator, validation_generator, epochs):
-    # Callbacks for better training control
-    # EarlyStopping: Stops training if no improvement. Explain use. [cite: 21]
-    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-    # ReduceLROnPlateau: Reduces learning rate if no improvement. Explain use. [cite: 21]
-    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=0.00001)
-
-    history = model.fit(
-        train_generator,
-        epochs=epochs,
-        validation_data=validation_generator,
-        callbacks=[early_stopping, reduce_lr]
+def train_model_with_callbacks(model, train_generator, validation_generator, epochs):
+    """
+    콜백을 사용한 모델 훈련
+    
+    사용된 콜백:
+    1. EarlyStopping: 검증 손실이 개선되지 않으면 조기 종료
+    2. ReduceLROnPlateau: 검증 손실이 개선되지 않으면 학습률 감소
+    
+    Args:
+        model: 훈련할 모델
+        train_generator: 훈련 데이터 제너레이터
+        validation_generator: 검증 데이터 제너레이터
+        epochs: 최대 에포크 수
+    
+    Returns:
+        훈련 히스토리
+    """
+    # Early Stopping 콜백
+    # validation loss가 10 에포크 동안 개선되지 않으면 훈련 중단
+    early_stopping = EarlyStopping(
+        monitor='val_loss',      # 모니터링할 메트릭
+        patience=10,             # 개선되지 않을 때 기다릴 에포크 수
+        restore_best_weights=True,  # 최적 가중치 복원
+        verbose=1
     )
+    
+    # Learning Rate Reduction 콜백
+    # validation loss가 5 에포크 동안 개선되지 않으면 학습률을 0.2배로 감소
+    reduce_lr = ReduceLROnPlateau(
+        monitor='val_loss',      # 모니터링할 메트릭
+        factor=0.2,              # 학습률 감소 비율
+        patience=5,              # 개선되지 않을 때 기다릴 에포크 수
+        min_lr=1e-7,             # 최소 학습률
+        verbose=1
+    )
+    
+    # 모델 training with GPU acceleration
+    with tf.device('/GPU:0' if tf.config.list_physical_devices('GPU') else '/CPU:0'):
+        history = model.fit(
+            train_generator,
+            epochs=epochs,
+            validation_data=validation_generator,
+            callbacks=[early_stopping, reduce_lr],
+            verbose=1
+        )
+    
     return history
 
-# --- 4. Evaluation ---
-def evaluate_model(model, test_generator):
-    results = model.evaluate(test_generator, verbose=1)
-    print(f"Test Loss: {results[0]}")
-    print(f"Test Accuracy: {results[1]}")
-    if len(results) > 2: # If F1 score metric was compiled in model
-        print(f"Test F1-score (macro): {results[2]}") # Index might change based on metrics order
-
-    # For confusion matrix and detailed F1 score using sklearn
-    y_pred_probabilities = model.predict(test_generator)
+def evaluate_model_comprehensive(model, test_generator, class_labels):
+    """
+    포괄적인 모델 평가
+    - 정확도, F1-score 계산
+    - Confusion Matrix 생성
+    - 클래스별 성능 분석
+    
+    Args:
+        model: 평가할 모델
+        test_generator: 테스트 데이터 제너레이터
+        class_labels: 클래스 레이블 리스트
+    
+    Returns:
+        accuracy, f1_score (macro average)
+    """
+    # 모델 예측
+    print("모델 예측 중...")
+    y_pred_probabilities = model.predict(test_generator, verbose=1)
     y_pred_classes = np.argmax(y_pred_probabilities, axis=1)
+    
+    # 실제 레이블
     y_true_classes = test_generator.classes
-    class_labels = list(test_generator.class_indices.keys())
-
-    # Calculate F1 score using scikit-learn (often more reliable for detailed reporting)
-    f1 = f1_score(y_true_classes, y_pred_classes, average='macro')
-    print(f"Test F1-score (macro sklearn): {f1}")
     
-    accuracy_sk = accuracy_score(y_true_classes, y_pred_classes)
-    print(f"Test Accuracy (sklearn): {accuracy_sk}")
-
-
-    # Confusion Matrix [cite: 22]
+    # 메트릭 계산
+    accuracy = accuracy_score(y_true_classes, y_pred_classes)
+    f1_macro = f1_score(y_true_classes, y_pred_classes, average='macro')
+    f1_weighted = f1_score(y_true_classes, y_pred_classes, average='weighted')
+    
+    print(f"테스트 정확도: {accuracy:.4f}")
+    print(f"F1-score (macro): {f1_macro:.4f}")
+    print(f"F1-score (weighted): {f1_weighted:.4f}")
+    
+    # Confusion Matrix 생성 및 저장
     cm = confusion_matrix(y_true_classes, y_pred_classes)
-    plt.figure(figsize=(15, 12)) # Adjust size depending on NUM_CLASSES
-    sns.heatmap(cm, annot=False, fmt='d', cmap='Blues') # Annot=True can be slow for many classes
-    plt.title('Confusion Matrix')
-    plt.ylabel('Actual Classes')
-    plt.xlabel('Predicted Classes')
-    # plt.xticks(ticks=np.arange(len(class_labels)), labels=class_labels, rotation=90)
-    # plt.yticks(ticks=np.arange(len(class_labels)), labels=class_labels, rotation=0)
-    plt.tight_layout()
-    plt.savefig('confusion_matrix.png') # Save for the report [cite: 8]
-    print("Confusion matrix saved as confusion_matrix.png")
-    # plt.show() # Display plot
-
-    return accuracy_sk, f1 # Return sklearn calculated metrics
-
-# --- 5. Plotting Training History ---
-def plot_history(history):
-    # Plot for accuracy and loss curves [cite: 22]
-    plt.figure(figsize=(12, 4))
-
-    # Plot training & validation accuracy values
-    plt.subplot(1, 2, 1)
-    plt.plot(history.history['accuracy'])
-    plt.plot(history.history['val_accuracy'])
-    plt.title('Model accuracy')
-    plt.ylabel('Accuracy')
-    plt.xlabel('Epoch')
-    plt.legend(['Train', 'Validation'], loc='upper left')
-
-    # Plot training & validation loss values
-    plt.subplot(1, 2, 2)
-    plt.plot(history.history['loss'])
-    plt.plot(history.history['val_loss'])
-    plt.title('Model loss')
-    plt.ylabel('Loss')
-    plt.xlabel('Epoch')
-    plt.legend(['Train', 'Validation'], loc='upper left')
-
-    plt.tight_layout()
-    plt.savefig('training_history.png') # Save for the report [cite: 8]
-    print("Training history plot saved as training_history.png")
-    # plt.show() # Display plot
-
-
-# --- Main Execution ---
-if __name__ == '__main__':
-    # Prepare dataset structure (run once initially)
-    if not create_processed_dirs():
-        print("Failed to prepare dataset directories. Exiting.")
-        exit()
-
-    # Get data generators
-    train_generator, validation_generator, test_generator = get_data_generators()
     
-    # Make sure NUM_CLASSES is correct (it's hardcoded above, but generator can verify)
-    if train_generator.num_classes != NUM_CLASSES:
-        print(f"Warning: Number of classes from generator ({train_generator.num_classes}) "
-              f"does not match configured NUM_CLASSES ({NUM_CLASSES}).")
-        # Potentially update NUM_CLASSES = train_generator.num_classes here if dynamic adjustment is desired.
-
-    # For averaging results over 10 trials [cite: 23]
-    num_trials = 1 # Set to 10 for the final assignment submission
-    all_accuracies = []
-    all_f1_scores = []
-
-    for i in range(num_trials):
-        print(f"\n--- Starting Trial {i+1}/{num_trials} ---")
-        
-        # Create and compile the model (re-create for each trial for independence)
-        # This ensures weights are re-initialized.
-        model = create_cnn_model(INPUT_SHAPE, NUM_CLASSES)
-        
-        history = train_model(model, train_generator, validation_generator, EPOCHS)
-        
-        acc, f1 = evaluate_model(model, test_generator)
-        all_accuracies.append(acc)
-        all_f1_scores.append(f1)
-        
-        if i == 0: # Plot history only for the first trial or save all if needed
-            plot_history(history)
-
-    print("\n--- Overall Results ---")
-    if num_trials > 1:
-        print(f"Average Accuracy over {num_trials} trials: {np.mean(all_accuracies):.4f} (+/- {np.std(all_accuracies):.4f})")
-        print(f"Average F1-score over {num_trials} trials: {np.mean(all_f1_scores):.4f} (+/- {np.std(all_f1_scores):.4f})")
+    # 클래스가 많을 경우 간단한 confusion matrix 플롯
+    plt.figure(figsize=(12, 10))
+    if len(class_labels) <= 20:  # 클래스가 20개 이하일 때만 레이블 표시
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                   xticklabels=class_labels, yticklabels=class_labels)
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
     else:
-        print(f"Accuracy (1 trial): {all_accuracies[0]:.4f}")
-        print(f"F1-score (1 trial): {all_f1_scores[0]:.4f}")
+        sns.heatmap(cm, cmap='Blues')
+    
+    plt.title('Confusion Matrix')
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.tight_layout()
+    plt.savefig('confusion_matrix.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # ROC Curve 계산 및 플롯 (다중 클래스)
+    print("ROC Curve 계산 및 플롯 중...")
+    n_classes = len(class_labels)
+    fpr = dict()
+    tpr = dict()
+    roc_auc = dict()
+    
+    # One-vs-Rest 전략
+    y_true_binary = tf.keras.utils.to_categorical(y_true_classes, num_classes=n_classes)
+    
+    for i in range(n_classes):
+        fpr[i], tpr[i], _ = roc_curve(y_true_binary[:, i], y_pred_probabilities[:, i])
+        roc_auc[i] = auc(fpr[i], tpr[i])
+    
+    # Macro-average ROC Curve 계산
+    # 모든 클래스의 FPR을 interpolate
+    all_fpr = np.unique(np.concatenate([fpr[i] for i in range(n_classes)]))
+    
+    # 각 클래스의 TPR을 all_fpr에 interpolate
+    mean_tpr = np.zeros_like(all_fpr)
+    for i in range(n_classes):
+        mean_tpr += np.interp(all_fpr, fpr[i], tpr[i])
+    
+    # 평균 내기 및 AUC 계산
+    mean_tpr /= n_classes
+    
+    fpr["macro"] = all_fpr
+    tpr["macro"] = mean_tpr
+    roc_auc["macro"] = auc(fpr["macro"], tpr["macro"])
+    
+    # ROC Curve 플롯
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr["macro"], tpr["macro"],
+             label=f'Macro-average ROC curve (area = {roc_auc["macro"]:.2f})',
+             color='navy', linestyle=':', linewidth=4)
+    
+    # 각 클래스의 ROC Curve 플롯 (선택 사항)
+    # for i in range(n_classes):
+    #     plt.plot(fpr[i], tpr[i], lw=2,
+    #              label=f'ROC curve of class {class_labels[i]} (area = {roc_auc[i]:.2f})')
+    
+    plt.plot([0, 1], [0, 1], 'k--', lw=2)
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC) Curve')
+    plt.legend(loc="lower right")
+    plt.tight_layout()
+    plt.savefig('roc_curve.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    return accuracy, f1_macro
 
-    # Remember to document hyperparameter choices and experiments in the report [cite: 21, 22]
-    print("\nEnd of script. Don't forget to complete your report!")
+def plot_training_history(history, trial_num=None):
+    """
+    훈련 히스토리 시각화
+    - 정확도 곡선
+    - 손실 곡선
+    
+    Args:
+        history: 훈련 히스토리
+        trial_num: 시도 번호 (선택사항)
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+    
+    # 정확도 플롯
+    ax1.plot(history.history['accuracy'], label='Training Accuracy', linewidth=2)
+    ax1.plot(history.history['val_accuracy'], label='Validation Accuracy', linewidth=2)
+    ax1.set_title('Model Accuracy')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Accuracy')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # 손실 플롯
+    ax2.plot(history.history['loss'], label='Training Loss', linewidth=2)
+    ax2.plot(history.history['val_loss'], label='Validation Loss', linewidth=2)
+    ax2.set_title('Model Loss')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Loss')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # 파일명 설정
+    filename = f'training_history_trial_{trial_num}.png' if trial_num else 'training_history.png'
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"훈련 히스토리 플롯 저장: {filename}")
+
+def main():
+    """
+    메인 실행 함수
+    전체 실험 프로세스 관리
+    """
+    print("=== CNN 모델 훈련 시작 ===")
+    print(f"시작 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # GPU 설정
+    setup_gpu()
+    
+    # 시드 설정 (재현 가능한 결과를 위해)
+    tf.random.set_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+    
+    # 데이터셋 준비
+    print("\n1. 데이터셋 준비 중...")
+    num_classes = create_directory_structure()
+    
+    # 데이터 제너레이터 생성
+    print("\n2. 데이터 제너레이터 생성 중...")
+    train_generator, validation_generator, test_generator = create_data_generators()
+    
+    # 클래스 정보 확인
+    class_labels = list(train_generator.class_indices.keys())
+    print(f"총 클래스 수: {len(class_labels)}")
+    print(f"훈련 샘플 수: {train_generator.samples}")
+    print(f"검증 샘플 수: {validation_generator.samples}")
+    print(f"테스트 샘플 수: {test_generator.samples}")
+    
+    # 하이퍼파라미터 실험 (선택사항)
+    # hyperparameter_experiment()
+    
+    # 1회 실험
+    print(f"\n3. 모델 훈련 시작...")
+    
+    print(f"\n--- 모델 훈련 및 평가 ---")
+    
+    # 모델 생성
+    model = create_cnn_model(Config.INPUT_SHAPE, len(class_labels))
+    
+    # 모델 훈련
+    start_time = time.time()
+    history = train_model_with_callbacks(
+        model, train_generator, validation_generator, Config.EPOCHS
+    )
+    training_time = time.time() - start_time
+    
+    print(f"훈련 시간: {training_time:.2f}초")
+    
+    # 모델 평가
+    accuracy, f1 = evaluate_model_comprehensive(model, test_generator, class_labels)
+    
+    # 훈련 히스토리 저장
+    plot_training_history(history, 1)
+    
+    # 최종 결과 출력
+    print("\n=== 최종 결과 ===")
+    print(f"테스트 정확도: {accuracy:.4f}")
+    print(f"F1-score: {f1:.4f}")
+    
+    # 결과를 파일로 저장
+    with open('experiment_results.txt', 'w', encoding='utf-8') as f:
+        f.write("=== CNN 실험 결과 ===\n")
+        f.write(f"데이터셋: Caltech-101\n")
+        f.write(f"클래스 수: {len(class_labels)}\n")
+        f.write(f"실험 횟수: 1\n")
+        f.write(f"테스트 정확도: {accuracy:.4f}\n")
+        f.write(f"F1-score: {f1:.4f}\n")
+        f.write(f"훈련 시간: {training_time:.2f}초\n")
+    
+    print(f"\n실험 완료: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("결과 파일 저장: experiment_results.txt, confusion_matrix.png, training_history_trial_1.png")
+
+if __name__ == '__main__':
+    main()
